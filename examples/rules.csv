@@ -1,0 +1,7 @@
+tag,field,pattern,category
+business,payee,HMRC%VAT%,VAT
+business,payee,HMRC%,Tax
+business,payee,%JANE EXAMPLE%,Paid to self
+business,payee,EXAMPLE SIPP%,Pension
+business,type,FasterPaymentIn,Income
+business,bank_category,Software and IT costs,Software

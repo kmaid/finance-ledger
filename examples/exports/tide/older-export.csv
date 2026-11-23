@@ -1,0 +1,3 @@
+"Date","Transaction ID","Transaction description","Reference","From","To","Paid in","Paid out","Category name","Transaction type","Status","Initiated by","Tag 1"
+"2025-02-03 09:00:00","'1002","JANE EXAMPLE ref: Salary","Salary","","JANE EXAMPLE","","2,000.00","","FasterPaymentOut","Pending","",""
+"2025-01-15 10:30:00","'1001","ACME CLIENT LTD ref: INV-1","INV-1","ACME CLIENT LTD","","12,000.00","","Income","FasterPaymentIn","Cleared","",""
