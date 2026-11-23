@@ -1,7 +1,7 @@
 # finance-ledger
 
 Turns bank exports into one SQLite database and a handful of report CSVs.
-Python standard library only, nothing to install.
+TypeScript on Node 24 or later, which runs it directly and has SQLite built in. No dependencies at run time.
 
 The code is public; the money is not. Everything personal lives in `data/`,
 which git ignores.
@@ -9,14 +9,14 @@ which git ignores.
 ## Run it
 
 ```
-python3 ledger.py
+node ledger.ts
 ```
 
 This deletes `data/ledger.db`, rebuilds it from the files below, and writes one
 CSV per report into `data/reports/`. Nothing is edited in place, so the exports,
 rules and overrides are the only things to keep safe.
 
-To try it with made-up data: `python3 ledger.py examples`
+To try it with made-up data: `node ledger.ts examples`
 
 ## What goes in `data/`
 
@@ -78,12 +78,14 @@ sqlite3 data/ledger.db "SELECT * FROM ledger WHERE category = 'Tax' AND posted_a
 | --- | --- |
 | `tide` | Tide's CSV export with `Transaction ID`, `Paid in` and `Paid out` columns. |
 
-To add a bank, write a `parse_<bank>` function in `ledger.py` that yields the
+To add a bank, write a `parse<Bank>` function in `ledger.ts` that returns the
 columns of the `transactions` table, and add it to `PARSERS`. It needs a stable
 id per transaction so that overlapping exports do not double count.
 
 ## Tests
 
 ```
-python3 -m unittest discover -s tests
+pnpm install   # only needed for the type check
+pnpm test
+pnpm typecheck
 ```

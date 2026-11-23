@@ -1,7 +1,7 @@
 # Everything personal lives in data/ and never gets committed:
 # bank exports, rules, overrides, the database and the generated reports.
 /data/
-__pycache__/
+node_modules/
 .DS_Store
 /examples/ledger.db
 /examples/reports/
