@@ -5,3 +5,8 @@ business,payee,%JANE EXAMPLE%,Paid to self
 business,payee,EXAMPLE SIPP%,Pension
 business,type,FasterPaymentIn,Income
 business,bank_category,Software and IT costs,Software
+business,type,DIRECTDEP,Income
+personal,type,buy,Crypto bought
+personal,type,sell,Crypto sold
+personal,type,deposit,Transfer
+personal,type,withdrawal,Transfer

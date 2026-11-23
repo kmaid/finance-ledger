@@ -111,7 +111,77 @@ function parseTide(rows: Row[]): Transaction[] {
   });
 }
 
-const PARSERS: Record<string, (rows: Row[]) => Transaction[]> = { tide: parseTide };
+/**
+ * For one-off imports from a bank that is not worth a parser of its own: a CSV
+ * that already has the columns of the transactions table, with the amount in pounds.
+ */
+function parsePlain(rows: Row[]): Transaction[] {
+  return rows.map((row) => ({
+    bank_id: column(row, "bank_id"),
+    posted_at: column(row, "posted_at"),
+    amount_pence: pence(column(row, "amount")),
+    description: column(row, "description"),
+    payee: column(row, "payee"),
+    reference: column(row, "reference"),
+    type: column(row, "type"),
+    status: column(row, "status"),
+    bank_category: column(row, "bank_category"),
+    bank_tag: column(row, "bank_tag"),
+  }));
+}
+
+/**
+ * Uphold holds many currencies but the ledger is in pounds, so only the pound
+ * side of each row is kept: deposits, withdrawals, and what was paid for or
+ * received from crypto. The crypto side is recorded in the description. Rows
+ * with no pounds in them (crypto to crypto, rewards, wallet transfers) are skipped.
+ */
+function parseUphold(rows: Row[]): Transaction[] {
+  const transactions: Transaction[] = [];
+  for (const row of rows) {
+    const from = { amount: column(row, "Origin Amount"), currency: column(row, "Origin Currency") };
+    const to = { amount: column(row, "Destination Amount"), currency: column(row, "Destination Currency") };
+    if (from.currency !== "GBP" && to.currency !== "GBP") continue;
+    const kind = column(row, "Type");
+    const line = (suffix: string, type: string, amount: string, sign: 1 | -1, payee: string) => {
+      const pounds = Math.round(Number(amount) * 100);
+      if (!Number.isFinite(pounds)) throw new Error(`not an amount of money in row ${column(row, "Id")}`);
+      transactions.push({
+        bank_id: column(row, "Id") + suffix,
+        posted_at: new Date(column(row, "Date")).toISOString().slice(0, 19).replace("T", " "),
+        amount_pence: sign * pounds,
+        description: `${from.amount} ${from.currency} to ${to.amount} ${to.currency}`,
+        payee,
+        reference: "",
+        type,
+        status: column(row, "Status") === "completed" ? "cleared" : "cancelled",
+        bank_category: "",
+        bank_tag: "",
+      });
+    };
+    if (from.currency === "GBP" && to.currency !== "GBP") {
+      // Crypto bought with a card or bank payment is a deposit and a purchase in one row.
+      if (kind === "in") line("-deposit", "deposit", from.amount, 1, column(row, "Origin"));
+      line("", "buy", from.amount, -1, to.currency);
+    } else if (from.currency !== "GBP" && kind !== "out") {
+      // Crypto sold, or foreign money paid in, arriving as pounds.
+      if (kind === "transfer") line("", "sell", to.amount, 1, from.currency);
+      else line("", "deposit", to.amount, 1, column(row, "Origin"));
+    } else if (from.currency !== "GBP") {
+      // Crypto sold and paid straight out to the bank: a sale and a withdrawal in one row.
+      line("", "sell", to.amount, 1, from.currency);
+      line("-withdrawal", "withdrawal", to.amount, -1, column(row, "Destination"));
+    } else if (kind === "out") line("", "withdrawal", from.amount, -1, column(row, "Destination"));
+    else line("", "deposit", to.amount, 1, column(row, "Origin"));
+  }
+  return transactions;
+}
+
+const PARSERS: Record<string, (rows: Row[]) => Transaction[]> = {
+  tide: parseTide,
+  uphold: parseUphold,
+  plain: parsePlain,
+};
 
 function latest(transactions: Transaction[]): string {
   return transactions.reduce((max, t) => (t.posted_at > max ? t.posted_at : max), "");

@@ -77,6 +77,8 @@ sqlite3 data/ledger.db "SELECT * FROM ledger WHERE category = 'Tax' AND posted_a
 | Bank | Export |
 | --- | --- |
 | `tide` | Tide's CSV export with `Transaction ID`, `Paid in` and `Paid out` columns. |
+| `uphold` | Uphold's transaction history CSV. Only the pound side of each row is kept: deposits, withdrawals, and crypto bought or sold for pounds. Rows with no pounds in them are skipped. |
+| `plain` | A CSV you have made yourself with the columns of the `transactions` table and an `amount` in pounds. For one-off imports from a bank that is not worth a parser. See `examples/exports/old-bank/`. |
 
 To add a bank, write a `parse<Bank>` function in `ledger.ts` that returns the
 columns of the `transactions` table, and add it to `PARSERS`. It needs a stable

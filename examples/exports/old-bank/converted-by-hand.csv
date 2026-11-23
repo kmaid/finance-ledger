@@ -1,0 +1,3 @@
+bank_id,posted_at,amount,description,payee,reference,type,status,bank_category,bank_tag
+old-001,2018-06-28 00:00:00,-1500.00,JANE EXAMPLE      MONEY      STO,JANE EXAMPLE,MONEY,REPEATPMT,cleared,,
+old-002,2018-06-29 00:00:00,2700.00,ACME CLIENT LTD   INV-0      BGC,ACME CLIENT LTD,INV-0,DIRECTDEP,cleared,,
