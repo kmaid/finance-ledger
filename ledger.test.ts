@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, test } from "node:test";
-import { build, parseCsv, pence } from "./ledger.ts";
+import { build, parseCsv, parseTsv, pence } from "./ledger.ts";
 
 let data: string;
 let db: DatabaseSync | undefined;
@@ -40,6 +40,13 @@ test("parseCsv handles quotes, commas and newlines inside fields", () => {
   ]);
 });
 
+test("parseTsv splits on tabs and leaves quotes alone", () => {
+  assert.deepEqual(parseTsv('a\t"b"\t\r\n\r\nc\td, e\t1\n'), [
+    ["a", '"b"', ""],
+    ["c", "d, e", "1"],
+  ]);
+});
+
 test("a transaction in two exports is stored once with its newest status", () => {
   db = build(data);
   assert.deepEqual(rows("SELECT COUNT(*) FROM transactions WHERE account = 'tide'"), [[8]]);
@@ -58,7 +65,7 @@ test("business yearly figures", () => {
 test("cancelled transactions are left out and unmatched ones are reported", () => {
   db = build(data);
   assert.deepEqual(rows("SELECT COUNT(*) FROM ledger WHERE payee LIKE 'Hosting%'"), [[0]]);
-  assert.deepEqual(rows("SELECT payee, total FROM uncategorised"), [["Corner Cafe - 1 High Street, London", -8.5]]);
+  assert.deepEqual(rows("SELECT payee, total FROM uncategorised WHERE tag = 'business'"), [["Corner Cafe - 1 High Street, London", -8.5]]);
 });
 
 test("the ledger adds up to the cleared transactions", () => {
@@ -108,9 +115,91 @@ test("uphold keeps the pound side of each row", () => {
     ["u7", "2026-03-06 10:00:00", 90000, "sell", "BTC", "cleared"],
     ["u7-withdrawal", "2026-03-06 10:00:00", -90000, "withdrawal", "", "cleared"],
   ]);
-  assert.deepEqual(rows("SELECT category, total FROM yearly_by_category WHERE tag = 'personal'"), [
+  assert.deepEqual(rows("SELECT category, total FROM yearly_by_category WHERE tag = 'personal' AND year = '2026'"), [
     ["Crypto bought", -1200],
     ["Crypto sold", 1550.25],
     ["Transfer", 300],
+  ]);
+});
+
+test("chase rows are read from a folder named in accounts.csv, with their text repaired", () => {
+  db = build(data);
+  const sql = `SELECT posted_at, amount_pence, type, payee, reference
+               FROM transactions WHERE account = 'chase-spending' ORDER BY id`;
+  assert.deepEqual(rows(sql), [
+    ["2025-02-03 09:01:00", 200000, "Payment", "EXAMPLE TRADING LTD", "Salary"],
+    ["2025-02-04 08:15:00", -340, "Purchase", "Corner Café", ""],
+    ["2025-02-04 08:15:00", -60, "Transfer", "Round up", ""],
+    ["2025-02-04 08:15:00", -340, "Purchase", "Corner Café", ""],
+    ["2025-02-04 08:15:00", -60, "Transfer", "Round up", ""],
+    // These three are in both exports and are stored once.
+    ["2025-02-10 19:30:00", -1000, "Purchase", "Bistro Exemple", "EUR 11.00 | FX rate £1 = €1.1000"],
+    ["2025-02-12 10:00:00", -50000, "Transfer", "Savings", ""],
+    ["2025-02-20 12:00:00", -40000, "Payment", "Jane Example", "House"],
+    ["2025-03-01 02:10:00", 125, "Interest", "Interest earned", ""],
+    ["2025-03-03 18:45:00", 2000, "Payment", "Sam & Alex", "dinner"],
+  ]);
+});
+
+test("chase rows that are the same in every column get ids that differ by a count", () => {
+  db = build(data);
+  const [first, second] = rows("SELECT bank_id FROM transactions WHERE payee = 'Corner Café' ORDER BY id").map(String);
+  assert.match(first, /^[0-9a-f]{16}-1$/);
+  assert.equal(second, first.replace(/-1$/, "-2"));
+});
+
+test("a chase export whose balances do not follow on is refused", () => {
+  const file = join(data, "exports", "chase", "savings", "savings_2025-02-01_2025-03-31.tsv");
+  writeFileSync(file, readFileSync(file, "utf8").replace("501.20", "501.21"));
+  assert.throws(() => build(data), /savings_2025.*the balance does not follow from the row before on 2025-02-12/);
+});
+
+test("an account whose folder does not exist yet is empty", () => {
+  appendFileSync(join(data, "accounts.csv"), "chase-later,chase,personal,chase/not-exported-yet\n");
+  db = build(data);
+  assert.deepEqual(rows("SELECT COUNT(*) FROM transactions WHERE account = 'chase-later'"), [[0]]);
+});
+
+test("transfers are paired with their other side", () => {
+  db = build(data);
+  const sql = `SELECT out_account, in_account, amount, out_category, in_category
+               FROM transfer_pairs ORDER BY out_posted_at, out_id`;
+  assert.deepEqual(rows(sql), [
+    // The business pays the owner: spending on one side, income on the other.
+    ["tide", "chase-spending", 2000, "Paid to self", "Paid to self"],
+    // Two round-ups alike in every way pair one to one.
+    ["chase-spending", "chase-savings", 0.6, "Transfer", "Transfer"],
+    ["chase-spending", "chase-savings", 0.6, "Transfer", "Transfer"],
+    ["chase-spending", "chase-savings", 500, "Transfer", "Transfer"],
+  ]);
+});
+
+test("transfer legs with no other side are listed", () => {
+  db = build(data);
+  assert.deepEqual(rows("SELECT date, account, amount FROM unpaired_transfers"), [
+    ["2018-06-28", "old-bank", -1500],
+    ["2025-02-20", "chase-spending", -400],
+    // Still a payment to the owner, and still one amount, after an override split it.
+    ["2025-03-01", "tide", -25000],
+    ["2026-03-01", "uphold", 1000],
+    ["2026-03-03", "uphold", 200],
+    ["2026-03-06", "uphold", -900],
+  ]);
+  assert.deepEqual(rows("SELECT * FROM transfer_summary WHERE from_account = 'chase-spending'"), [
+    ["chase-spending", "(not in the ledger)", 1, 400],
+    ["chase-spending", "chase-savings", 3, 501.2],
+  ]);
+});
+
+test("personal income and spending leave transfers out", () => {
+  db = build(data);
+  // 2025: pay, interest and a friend paying back come in; two coffees and a meal go out;
+  // the 400 sent to an account that is not loaded is the only transfer that does not cancel.
+  assert.deepEqual(rows("SELECT * FROM personal_yearly"), [
+    ["2025", 2022.05, -16.8, -400, 1605.25],
+    ["2026", 1550.25, -1200, 300, 650.25],
+  ]);
+  assert.deepEqual(rows("SELECT * FROM personal_monthly WHERE month = '2025-02'"), [
+    ["2025-02", 2000, -16.8, -400, 1583.2],
   ]);
 });

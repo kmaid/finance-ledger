@@ -1,4 +1,6 @@
-account,bank,tag
+account,bank,tag,folder
 tide,tide,business
 old-bank,plain,business
 uphold,uphold,personal
+chase-spending,chase,personal,chase/spending
+chase-savings,chase,personal,chase/savings

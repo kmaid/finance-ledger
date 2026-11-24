@@ -7,12 +7,36 @@
  * the database is disposable and the exports, rules and overrides are the truth.
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const HERE = import.meta.dirname;
-const REPORTS = ["business_yearly", "yearly_by_category", "monthly_by_category", "uncategorised"];
+const REPORTS = [
+  "business_yearly",
+  "personal_yearly",
+  "personal_monthly",
+  "yearly_by_category",
+  "monthly_by_category",
+  "transfer_summary",
+  "unpaired_transfers",
+  "uncategorised",
+];
+const MONTHS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
 const RULE_FIELDS = ["payee", "description", "reference", "type", "bank_category", "bank_tag"];
 
 type Row = Record<string, string>;
@@ -70,10 +94,33 @@ export function parseCsv(text: string): string[][] {
   return records;
 }
 
-/** Read a CSV file with a header line into one object per row. */
-function readCsv(path: string): Row[] {
-  const [header = [], ...records] = parseCsv(readFileSync(path, "utf8").replace(/^﻿/, ""));
-  return records.map((record) => Object.fromEntries(header.map((name, i) => [name, record[i] ?? ""])));
+/** Split tab-separated text into records of fields. A field never has a tab in it, so quotes mean nothing here. */
+export function parseTsv(text: string): string[][] {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => line !== "")
+    .map((line) => line.split("\t"));
+}
+
+/**
+ * The text of a file. Some exports have been through a tool that read their
+ * UTF-8 as Latin-1 and saved it as UTF-8 again, which turns '£' into 'Â£'.
+ * Those start with a mangled byte order mark, and are put right here.
+ */
+function readText(path: string): string {
+  const text = readFileSync(path, "utf8");
+  const repaired = text.startsWith("ï»¿") ? Buffer.from(text, "latin1").toString("utf8") : text;
+  return repaired.replace(/^\uFEFF/, "");
+}
+
+/**
+ * Read a .csv or .tsv file with a header line into one object per row.
+ * `titleLines` is how many lines the file has above its header.
+ */
+function readTable(path: string, titleLines = 0): Row[] {
+  const records = path.endsWith(".tsv") ? parseTsv(readText(path)) : parseCsv(readText(path));
+  const [header = [], ...rest] = records.slice(titleLines);
+  return rest.map((record) => Object.fromEntries(header.map((name, i) => [name, record[i] ?? ""])));
 }
 
 function toCsv(records: unknown[][]): string {
@@ -177,10 +224,72 @@ function parseUphold(rows: Row[]): Transaction[] {
   return transactions;
 }
 
-const PARSERS: Record<string, (rows: Row[]) => Transaction[]> = {
-  tide: parseTide,
-  uphold: parseUphold,
-  plain: parsePlain,
+/** '5 April 2022' and '9:41' -> '2022-04-05 09:41:00' */
+function chaseTime(date: string, time: string): string {
+  const [day = "", month = "", year = ""] = date.split(" ");
+  const number = MONTHS.indexOf(month) + 1;
+  if (number === 0 || !/^\d{1,2}$/.test(day) || !/^\d{4}$/.test(year) || !/^\d{1,2}:\d\d$/.test(time)) {
+    throw new Error(`not a date and time: '${date} ${time}'`);
+  }
+  return `${year}-${String(number).padStart(2, "0")}-${day.padStart(2, "0")} ${time.padStart(5, "0")}:00`;
+}
+
+/**
+ * Chase gives no transaction id, so one is made from what the row says: a hash
+ * of its time, type, description and amount, then a count to tell apart rows
+ * that are the same in all four. An export covers whole days, so rows as
+ * alike as that are always in the same file and get the same count every time.
+ * The balance is left out of the hash, or a late correction to one old row
+ * would change the id of every row after it. It is checked instead: each
+ * balance must be the one before plus the amount, so a file with a row
+ * missing or out of order is refused.
+ */
+function parseChase(rows: Row[]): Transaction[] {
+  const seen = new Map<string, number>();
+  let before: number | undefined;
+  return rows.map((row) => {
+    const posted_at = chaseTime(column(row, "Date"), column(row, "Time"));
+    const amount = pence(column(row, "Amount"));
+    const balance = pence(column(row, "Balance"));
+    if (column(row, "Currency") !== "GBP") throw new Error(`not in pounds on ${posted_at.slice(0, 10)}`);
+    if (before !== undefined && before + amount !== balance) {
+      throw new Error(`the balance does not follow from the row before on ${posted_at.slice(0, 10)}`);
+    }
+    before = balance;
+
+    // Payments abroad carry the foreign amount and rate after the type: 'Purchase | EUR 11.00 | FX rate ...'.
+    const [type = "", ...foreign] = column(row, "Transaction Type").split(" | ");
+    const description = column(row, "Transaction Description").replaceAll("&amp;", "&").trim();
+    // 'From A Person - thanks' and 'To A Person - thanks' are the payee and the payer's reference.
+    const [payee = "", ...reference] = description.replace(/^(From|To)( |$)/, "").split(" - ");
+
+    const hash = createHash("sha256")
+      .update([posted_at, column(row, "Transaction Type"), column(row, "Transaction Description"), amount].join("\t"))
+      .digest("hex")
+      .slice(0, 16);
+    const count = (seen.get(hash) ?? 0) + 1;
+    seen.set(hash, count);
+    return {
+      bank_id: `${hash}-${count}`,
+      posted_at,
+      amount_pence: amount,
+      description,
+      payee,
+      reference: [reference.join(" - "), ...foreign].filter(Boolean).join(" | "),
+      type,
+      status: "cleared",
+      bank_category: "",
+      bank_tag: "",
+    };
+  });
+}
+
+/** How to read each bank's exports. `titleLines` is how many lines a file has above its header. */
+const BANKS: Record<string, { parse: (rows: Row[]) => Transaction[]; titleLines?: number }> = {
+  tide: { parse: parseTide },
+  uphold: { parse: parseUphold },
+  chase: { parse: parseChase, titleLines: 1 },
+  plain: { parse: parsePlain },
 };
 
 function latest(transactions: Transaction[]): string {
@@ -200,16 +309,17 @@ function loadTransactions(db: DatabaseSync, data: string): void {
         bank_category = excluded.bank_category, bank_tag = excluded.bank_tag,
         source_file = excluded.source_file
   `);
-  for (const { account, bank } of db.prepare("SELECT account, bank FROM accounts").all() as Row[]) {
-    const parser = PARSERS[bank];
-    if (!parser) {
-      throw new Error(`accounts.csv: no parser for bank '${bank}' (have: ${Object.keys(PARSERS).join(", ")})`);
+  const accounts = db.prepare("SELECT account, bank, folder FROM accounts").all() as Row[];
+  for (const { account, bank, folder: name } of accounts) {
+    const reader = BANKS[bank];
+    if (!reader) {
+      throw new Error(`accounts.csv: no parser for bank '${bank}' (have: ${Object.keys(BANKS).join(", ")})`);
     }
-    const folder = join(data, "exports", account);
-    const files = existsSync(folder) ? readdirSync(folder).filter((name) => name.endsWith(".csv")) : [];
+    const folder = join(data, "exports", name);
+    const files = existsSync(folder) ? readdirSync(folder).filter((file) => /\.(csv|tsv)$/.test(file)) : [];
     const exports = files.map((file) => {
       try {
-        return { file, transactions: parser(readCsv(join(folder, file))) };
+        return { file, transactions: reader.parse(readTable(join(folder, file), reader.titleLines)) };
       } catch (error) {
         throw new Error(`${join(folder, file)}: not a ${bank} export this parser understands, ${(error as Error).message}`);
       }
@@ -227,7 +337,7 @@ function loadRules(db: DatabaseSync, data: string): void {
   const path = join(data, "rules.csv");
   if (!existsSync(path)) return;
   const insert = db.prepare("INSERT INTO rules VALUES (?, ?, ?, ?, ?)");
-  readCsv(path).forEach((row, index) => {
+  readTable(path).forEach((row, index) => {
     const line = index + 2;
     if (!RULE_FIELDS.includes(row.field)) {
       throw new Error(`rules.csv line ${line}: field must be one of ${RULE_FIELDS.join(", ")}`);
@@ -241,7 +351,7 @@ function loadOverrides(db: DatabaseSync, data: string): void {
   if (!existsSync(path)) return;
   const find = db.prepare("SELECT 1 FROM transactions WHERE account = ? AND bank_id = ?");
   const insert = db.prepare("INSERT INTO overrides VALUES (?, ?, ?, ?, ?)");
-  readCsv(path).forEach((row, index) => {
+  readTable(path).forEach((row, index) => {
     if (!find.get(row.account, row.bank_id)) {
       throw new Error(`overrides.csv line ${index + 2}: no transaction ${row.bank_id} in ${row.account}`);
     }
@@ -265,8 +375,10 @@ export function build(data: string): DatabaseSync {
   const db = new DatabaseSync(database);
   try {
     db.exec(readFileSync(join(HERE, "schema.sql"), "utf8"));
-    const insertAccount = db.prepare("INSERT INTO accounts VALUES (?, ?, ?)");
-    for (const row of readCsv(join(data, "accounts.csv"))) insertAccount.run(row.account, row.bank, row.tag);
+    const insertAccount = db.prepare("INSERT INTO accounts VALUES (?, ?, ?, ?)");
+    for (const row of readTable(join(data, "accounts.csv"))) {
+      insertAccount.run(row.account, row.bank, row.tag, row.folder || row.account);
+    }
     db.exec("BEGIN");
     loadTransactions(db, data);
     loadRules(db, data);
@@ -312,6 +424,8 @@ function main(): void {
     .get()!;
   const pounds = Number(total).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   console.log(`uncategorised: ${lines} lines worth £${pounds}`);
+  const { unpaired } = db.prepare("SELECT COUNT(*) AS unpaired FROM unpaired_transfers").get()!;
+  console.log(`transfers with no other side: ${unpaired}`);
   console.log(`database: ${join(data, "ledger.db")}`);
   console.log(`reports:  ${join(data, "reports")}`);
   db.close();

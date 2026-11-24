@@ -2,16 +2,17 @@
 -- Tables hold what was loaded from data/; all the arithmetic lives in views.sql.
 
 CREATE TABLE accounts (
-    account TEXT PRIMARY KEY,  -- folder name under data/exports/
+    account TEXT PRIMARY KEY,
     bank    TEXT NOT NULL,     -- which parser reads its files
-    tag     TEXT NOT NULL      -- 'business' or 'personal'
+    tag     TEXT NOT NULL,     -- 'business' or 'personal'
+    folder  TEXT NOT NULL      -- where its exports are under data/exports/; the account name unless given
 );
 
 -- One row per bank transaction, exactly as the bank reported it.
 CREATE TABLE transactions (
     id            INTEGER PRIMARY KEY,
     account       TEXT NOT NULL REFERENCES accounts (account),
-    bank_id       TEXT NOT NULL,     -- the bank's own transaction id
+    bank_id       TEXT NOT NULL,     -- the bank's own transaction id, or one made from the row if it has none
     posted_at     TEXT NOT NULL,     -- YYYY-MM-DD HH:MM:SS
     amount_pence  INTEGER NOT NULL,  -- money in is positive, money out is negative
     description   TEXT NOT NULL,

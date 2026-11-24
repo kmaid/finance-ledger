@@ -10,3 +10,7 @@ personal,type,buy,Crypto bought
 personal,type,sell,Crypto sold
 personal,type,deposit,Transfer
 personal,type,withdrawal,Transfer
+personal,type,Transfer,Transfer
+personal,type,Interest,Interest
+personal,payee,EXAMPLE TRADING LTD,Paid to self
+personal,payee,%Jane Example%,Transfer

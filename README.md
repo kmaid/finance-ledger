@@ -22,8 +22,8 @@ To try it with made-up data: `node ledger.ts examples`
 
 | File | What it is |
 | --- | --- |
-| `accounts.csv` | One line per account: its folder name, its bank, and a tag (`business` or `personal`). |
-| `exports/<account>/*.csv` | Exports from the bank, unedited. Overlapping exports are fine. |
+| `accounts.csv` | One line per account: its name, its bank, a tag (`business` or `personal`), and optionally the folder its exports are in. |
+| `exports/<folder>/` | Exports from the bank (`.csv` or `.tsv`), unedited. Overlapping exports are fine. The folder is the account name unless `accounts.csv` gives another, such as `chase/spending`. |
 | `rules.csv` | Puts transactions in categories. Optional. |
 | `overrides.csv` | Categorises single transactions by hand. Optional. |
 
@@ -62,8 +62,11 @@ cleared transactions to the penny and stops if it does not.
 | Report | What it shows |
 | --- | --- |
 | `business_yearly` | Per calendar year: paid to self, average monthly pay (the total over 12), tax, pension, ISA. Reads the categories `Paid to self`, `Tax`, `Pension` and `ISA`. |
+| `personal_yearly`, `personal_monthly` | Personal income, spending and transfers. See below. |
 | `yearly_by_category` | Totals per tag, year and category. |
 | `monthly_by_category` | Totals per tag, month and category. |
+| `transfer_summary` | How many transfers, and how much, went between each two accounts or have no other side. |
+| `unpaired_transfers` | Every transfer with no other side in the ledger. |
 | `uncategorised` | Payees no rule matched, biggest first. |
 
 To see the transactions behind any figure:
@@ -72,12 +75,47 @@ To see the transactions behind any figure:
 sqlite3 data/ledger.db "SELECT * FROM ledger WHERE category = 'Tax' AND posted_at LIKE '2025%'"
 ```
 
+## Transfers between your own accounts
+
+Money moved from one of your accounts to another shows up twice, and is neither
+income nor spending. Two categories mark it, and rules assign them like any other:
+
+- `Transfer` for a move between accounts with the same tag: current account to
+  savings pot, bank to crypto exchange, or to an account that is not loaded.
+- `Paid to self` on both sides when the business pays you. The business rule
+  matches your name and the personal rule matches the company's. It is spending
+  for the business and income for you, so it stays in the personal figures.
+
+```
+personal,type,Transfer,Transfer
+personal,payee,EXAMPLE TRADING LTD,Paid to self
+personal,payee,%Jane Example%,Transfer
+```
+
+`personal_yearly` and `personal_monthly` then give `income` (money in),
+`spending` (money out), both without `Transfer` lines, and `transfers`. Transfers
+between two loaded personal accounts cancel, so `transfers` is what went to
+(minus) or came from accounts that are not loaded. The three add up to `net`,
+the change in what the personal accounts hold.
+
+To check that a transfer really was one, the `transfer_pairs` view puts each leg
+next to its other side: the same amount, in a different account, within two
+days. Whatever has no other side is listed in `unpaired_transfers`. Each of
+those went to or came from an account that is not loaded, or is not a transfer
+at all and needs a better rule. A payment to yourself that an override files
+under something else (`ISA`, say) is still paired, as one whole amount.
+
+```
+sqlite3 data/ledger.db "SELECT * FROM transfer_pairs WHERE out_account = 'chase-spending'"
+```
+
 ## Banks
 
 | Bank | Export |
 | --- | --- |
 | `tide` | Tide's CSV export with `Transaction ID`, `Paid in` and `Paid out` columns. |
 | `uphold` | Uphold's transaction history CSV. Only the pound side of each row is kept: deposits, withdrawals, and crypto bought or sold for pounds. Rows with no pounds in them are skipped. |
+| `chase` | Chase UK statement transactions as tab-separated text (`.tsv`): a title line, then `Date`, `Time`, `Transaction Type`, `Transaction Description`, `Amount`, `Currency`, `Balance`. One folder per account or pot. Chase gives no transaction id, so one is made from each row's time, type, description and amount. Each file's balances are checked: every balance must be the one before plus the amount. |
 | `plain` | A CSV you have made yourself with the columns of the `transactions` table and an `amount` in pounds. For one-off imports from a bank that is not worth a parser. See `examples/exports/old-bank/`. |
 
 To add a bank, write a `parse<Bank>` function in `ledger.ts` that returns the
