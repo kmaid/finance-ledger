@@ -1,7 +1,7 @@
 // Builds a ledger from the made-up data in examples/ and checks the figures.
 
 import assert from "node:assert/strict";
-import { appendFileSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -234,4 +234,47 @@ test("santander descriptions are split into type, payee and reference", () => {
     ["SOMETHING NEW", { type: "", payee: "SOMETHING NEW", reference: "" }],
   ];
   for (const [description, expected] of cases) assert.deepEqual(santanderDescription(description), expected);
+});
+
+test("the database is kept between runs and backed up before each one", () => {
+  db = build(data);
+  db.exec("INSERT INTO rules VALUES (0, '', 'payee', 'Corner Cafe%', 'Coffee')");
+  db.close();
+  rmSync(join(data, "exports", "tide", "older-export.csv"));
+  db = build(data);
+  // The rule edited in the database is still there, and the transactions from the deleted export are kept.
+  assert.deepEqual(rows("SELECT category FROM ledger WHERE payee LIKE 'Corner Cafe%'"), [["Coffee"]]);
+  assert.deepEqual(rows("SELECT COUNT(*) FROM transactions WHERE account = 'tide'"), [[8]]);
+  assert.equal(readdirSync(join(data, "backups")).length, 1);
+});
+
+test("the CSVs only fill their tables the first time", () => {
+  db = build(data);
+  const before = rows("SELECT COUNT(*) FROM rules");
+  db.close();
+  appendFileSync(join(data, "rules.csv"), ",payee,%,Everything\n");
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message: string) => warnings.push(message);
+  try {
+    db = build(data);
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(rows("SELECT COUNT(*) FROM rules"), before);
+  assert.match(warnings.join("\n"), /rules\.csv has changed/);
+});
+
+test("lodger payments are matched to the lodger by payee and dates", () => {
+  db = build(data);
+  db.exec(`
+    INSERT INTO rules VALUES (0, '', 'payee', 'ACME CLIENT%', 'Rent received');
+    INSERT INTO lodgers (name, room, rent_pence, start_month, end_month, payee, source)
+    VALUES ('Acme', 'Large', 1200000, '2025-01', '2025-03', 'ACME CLIENT%', 'test');
+    INSERT INTO tax_returns (tax_year, method, gross_rent_pence, source) VALUES ('2024/25', 'property income', 1200000, 'test');
+  `);
+  assert.deepEqual(rows("SELECT tax_year, lodger, kind, amount FROM lodger_payments"), [["2024/25", "Acme", "rent", 12000]]);
+  assert.deepEqual(rows("SELECT tax_year, lodgers_in_list, bank_rent, return_gross_rent FROM rent_by_tax_year"), [
+    ["2024/25", "Acme (Large)", 12000, 12000],
+  ]);
 });

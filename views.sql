@@ -249,3 +249,64 @@ FROM ledger
 WHERE tag = 'personal'
 GROUP BY year
 ORDER BY year;
+
+-- UK tax year of a timestamp: 6 April to 5 April, written '2019/20'.
+-- Each payment from a lodger: a 'Rent received' line whose payee matches a
+-- lodger's pattern while they were there. Deposits are told apart by their text.
+CREATE VIEW lodger_payments AS
+SELECT
+    CASE WHEN substr(l.posted_at, 6, 5) >= '04-06'
+         THEN substr(l.posted_at, 1, 4) || '/' || substr(CAST(substr(l.posted_at, 1, 4) + 1 AS TEXT), 3, 2)
+         ELSE CAST(substr(l.posted_at, 1, 4) - 1 AS TEXT) || '/' || substr(l.posted_at, 3, 2)
+    END AS tax_year,
+    substr(l.posted_at, 1, 10) AS date,
+    p.name AS lodger,
+    p.room,
+    CASE
+        WHEN t.description LIKE '%deposit%' OR t.reference LIKE '%deposit%' THEN 'deposit'
+        WHEN l.amount_pence < 0 THEN 'refund'
+        ELSE 'rent'
+    END AS kind,
+    l.amount_pence / 100.0 AS amount,
+    l.account,
+    t.bank_id
+FROM ledger l
+JOIN transactions t ON t.id = l.transaction_id
+JOIN lodgers p
+  ON p.payee IS NOT NULL
+ AND l.payee LIKE p.payee
+ AND substr(l.posted_at, 1, 7) BETWEEN p.start_month AND COALESCE(p.end_month, '9999-12')
+WHERE l.category = 'Rent received';
+
+-- One row per tax year: what the return said next to what the bank and the
+-- lodger list show. The bank only goes back to whenever the exports start.
+CREATE VIEW rent_by_tax_year AS
+WITH years AS (
+    SELECT tax_year FROM tax_returns
+    UNION SELECT tax_year FROM lodger_payments
+),
+ranges AS (
+    SELECT tax_year,
+           substr(tax_year, 1, 4) || '-04' AS first_month,
+           CAST(substr(tax_year, 1, 4) + 1 AS TEXT) || '-03' AS last_month
+    FROM years
+)
+SELECT
+    r.tax_year,
+    (SELECT GROUP_CONCAT(name || ' (' || room || ')', ', ') FROM (
+        SELECT DISTINCT name, room FROM lodgers
+        WHERE start_month <= r.last_month AND COALESCE(end_month, '9999-12') >= r.first_month
+     )) AS lodgers_in_list,
+    (SELECT SUM(amount) FROM lodger_payments p WHERE p.tax_year = r.tax_year AND kind = 'rent') AS bank_rent,
+    (SELECT SUM(amount) FROM lodger_payments p WHERE p.tax_year = r.tax_year AND kind <> 'rent') AS bank_deposits_and_refunds,
+    x.method AS return_method,
+    x.gross_rent_pence / 100.0 AS return_gross_rent,
+    x.expenses_pence / 100.0 AS return_expenses,
+    x.property_result AS return_property_result,
+    x.total_tax_pence / 100.0 AS return_total_tax,
+    x.accountant,
+    x.source,
+    x.notes
+FROM ranges r
+LEFT JOIN tax_returns x USING (tax_year)
+ORDER BY r.tax_year;

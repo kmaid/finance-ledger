@@ -12,9 +12,13 @@ which git ignores.
 node ledger.ts
 ```
 
-This deletes `data/ledger.db`, rebuilds it from the files below, and writes one
-CSV per report into `data/reports/`. Nothing is edited in place, so the exports,
-rules and overrides are the only things to keep safe.
+`data/ledger.db` is the source of truth. Each run copies it to `data/backups/`
+(the last 20 are kept), imports every bank export into it, recreates the views,
+checks that everything reconciles, and writes one CSV per report into
+`data/reports/`. Imports add new transactions and update changed ones but never
+delete, so an export can be thrown away once it has been imported. Keep
+`ledger.db` (and its backups) safe: it holds the rules, overrides and records
+that exist nowhere else.
 
 To try it with made-up data: `node ledger.ts examples`
 
@@ -22,14 +26,13 @@ To try it with made-up data: `node ledger.ts examples`
 
 | File | What it is |
 | --- | --- |
-| `accounts.csv` | One line per account: its name, its bank, a tag (`business` or `personal`), and optionally the folder its exports are in. |
-| `exports/<folder>/` | Exports from the bank (`.csv`, `.tsv` or Santander's `.xls`), unedited. Overlapping exports are fine. The folder is the account name unless `accounts.csv` gives another, such as `chase/spending`. |
-| `rules.csv` | Puts transactions in categories. Optional. |
-| `overrides.csv` | Categorises single transactions by hand. Optional. |
+| `ledger.db` | The ledger. Everything below is either imported into it or used once to start it. |
+| `exports/<folder>/` | Exports from the bank (`.csv`, `.tsv` or Santander's `.xls`), unedited. Overlapping exports are fine. The folder is the account name unless the `accounts` table gives another, such as `chase/spending`. |
+| `accounts.csv`, `rules.csv`, `overrides.csv` | Optional starting points. Each fills its table the first time the table is empty; after that the table in `ledger.db` is edited directly (for example with `sqlite3 data/ledger.db`), and a changed CSV is reported, not read. |
 
 `examples/` has a working copy of each.
 
-**Rules** are checked top to bottom and the first match wins. `field` is one of
+**Rules** are checked in `priority` order and the first match wins. `field` is one of
 `payee`, `description`, `reference`, `type`, `bank_category` or `bank_tag`, and
 `pattern` is a SQL `LIKE` pattern (`%` matches anything, case does not matter).
 A blank `tag` applies the rule to every account.
@@ -51,8 +54,11 @@ tide,1004,ISA,20000,lump sum of 25000: 20000 ISA and the rest pay
 
 ## How the figures are made
 
-1. `schema.sql` defines four tables: `accounts`, `transactions`, `rules`, `overrides`.
-   They hold what was loaded and nothing else.
+1. `schema.sql` defines the tables: `accounts`, `transactions`, `rules`,
+   `overrides`, and two kept by hand for tax: `lodgers` (who rented a room, when
+   and for how much) and `tax_returns` (what each Self Assessment return said
+   about the rent). It only ever adds tables, so it runs safely on an existing
+   database.
 2. `views.sql` does all the arithmetic. `categorised` applies the rules, `ledger`
    applies the overrides, and the reports are plain `GROUP BY`s over `ledger`.
 
@@ -68,6 +74,11 @@ cleared transactions to the penny and stops if it does not.
 | `transfer_summary` | How many transfers, and how much, went between each two accounts or have no other side. |
 | `unpaired_transfers` | Every transfer with no other side in the ledger. |
 | `uncategorised` | Payees no rule matched, biggest first. |
+
+Two more views are for tax and are not written as reports: `lodger_payments`
+(every `Rent received` line matched to a lodger by their `payee` pattern and the
+months they were there) and `rent_by_tax_year` (each tax year's return next to
+the lodgers listed and the rent the bank shows).
 
 To see the transactions behind any figure:
 

@@ -1,14 +1,17 @@
 /**
- * Rebuild data/ledger.db from the bank exports and write the report CSVs.
+ * Import bank exports into data/ledger.db and write the report CSVs.
  *
  * Usage: node ledger.ts [data-directory]
  *
- * Everything is rebuilt from the files in the data directory on every run, so
- * the database is disposable and the exports, rules and overrides are the truth.
+ * ledger.db is the source of truth and is kept between runs. Each run backs it
+ * up, imports every export (adding new transactions and updating changed ones,
+ * never deleting), recreates the views and checks that everything reconciles.
+ * accounts.csv, rules.csv and overrides.csv only fill their tables the first
+ * time; after that the tables are edited directly.
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -481,22 +484,14 @@ function loadTransactions(db: DatabaseSync, data: string): void {
   }
 }
 
-function loadRules(db: DatabaseSync, data: string): void {
-  const path = join(data, "rules.csv");
-  if (!existsSync(path)) return;
+/** Fill the rules table from rules.csv. Only used while the table is empty. */
+function seedRules(db: DatabaseSync, path: string): void {
   const insert = db.prepare("INSERT INTO rules VALUES (?, ?, ?, ?, ?)");
-  readTable(path).forEach((row, index) => {
-    const line = index + 2;
-    if (!RULE_FIELDS.includes(row.field)) {
-      throw new Error(`rules.csv line ${line}: field must be one of ${RULE_FIELDS.join(", ")}`);
-    }
-    insert.run(line, row.tag, row.field, row.pattern, row.category);
-  });
+  readTable(path).forEach((row, index) => insert.run(index + 2, row.tag, row.field, row.pattern, row.category));
 }
 
-function loadOverrides(db: DatabaseSync, data: string): void {
-  const path = join(data, "overrides.csv");
-  if (!existsSync(path)) return;
+/** Fill the overrides table from overrides.csv. Only used while the table is empty. */
+function seedOverrides(db: DatabaseSync, path: string): void {
   const find = db.prepare("SELECT 1 FROM transactions WHERE account = ? AND bank_id = ?");
   const insert = db.prepare("INSERT INTO overrides VALUES (?, ?, ?, ?, ?)");
   readTable(path).forEach((row, index) => {
@@ -505,6 +500,43 @@ function loadOverrides(db: DatabaseSync, data: string): void {
     }
     insert.run(row.account, row.bank_id, row.category, pence(row.amount) || null, row.note);
   });
+}
+
+/**
+ * accounts.csv, rules.csv and overrides.csv fill their tables the first time
+ * only. After that the database is the truth, so a CSV that has changed since
+ * is reported rather than read.
+ */
+function seed(db: DatabaseSync, data: string, table: string, file: string, fill: (path: string) => void): void {
+  const path = join(data, file);
+  if (!existsSync(path)) return;
+  const key = `seeded:${file}`;
+  const stamp = String(statSync(path).mtimeMs);
+  const seeded = db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as Row | undefined;
+  const empty = !db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+  if (!seeded && empty) {
+    fill(path);
+    db.prepare("INSERT INTO meta VALUES (?, ?)").run(key, stamp);
+  } else if (seeded && seeded.value !== stamp) {
+    console.warn(`${file} has changed, but it is not read any more: edit the ${table} table in ledger.db instead`);
+  } else if (!seeded) {
+    db.prepare("INSERT INTO meta VALUES (?, ?)").run(key, stamp);
+  }
+}
+
+/** Checks on the hand-kept tables, run every time because they are edited directly. */
+function checkTables(db: DatabaseSync): void {
+  const badRule = db
+    .prepare(`SELECT priority, field FROM rules WHERE field NOT IN (${RULE_FIELDS.map(() => "?").join(", ")})`)
+    .get(...RULE_FIELDS);
+  if (badRule) throw new Error(`rule ${badRule.priority}: field must be one of ${RULE_FIELDS.join(", ")}`);
+  const missing = db
+    .prepare(`
+      SELECT o.account, o.bank_id FROM overrides o
+      LEFT JOIN transactions t USING (account, bank_id) WHERE t.id IS NULL
+    `)
+    .get();
+  if (missing) throw new Error(`override for ${missing.account} ${missing.bank_id}: no such transaction`);
   const tooMuch = db
     .prepare(`
       SELECT o.bank_id
@@ -513,26 +545,42 @@ function loadOverrides(db: DatabaseSync, data: string): void {
       HAVING SUM(COALESCE(o.amount_pence, ABS(t.amount_pence))) > ABS(t.amount_pence)
     `)
     .get();
-  if (tooMuch) throw new Error(`overrides.csv: overrides add up to more than the transaction for ${tooMuch.bank_id}`);
+  if (tooMuch) throw new Error(`overrides add up to more than the transaction for ${tooMuch.bank_id}`);
 }
 
-/** Rebuild the database and reports in a data directory. The caller closes the database. */
+/** Copy the database aside before changing it, keeping the newest `keep` copies. */
+function backup(database: string, data: string, keep = 20): void {
+  if (!existsSync(database)) return;
+  const folder = join(data, "backups");
+  mkdirSync(folder, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+  copyFileSync(database, join(folder, `ledger-${stamp}.db`));
+  const copies = readdirSync(folder).filter((file) => /^ledger-.*\.db$/.test(file)).sort();
+  for (const old of copies.slice(0, Math.max(0, copies.length - keep))) rmSync(join(folder, old));
+}
+
+/** Import into the database in a data directory and write the reports. The caller closes the database. */
 export function build(data: string): DatabaseSync {
   const database = join(data, "ledger.db");
-  rmSync(database, { force: true });
+  backup(database, data);
   const db = new DatabaseSync(database);
   try {
+    db.exec("PRAGMA foreign_keys = ON");
     db.exec(readFileSync(join(HERE, "schema.sql"), "utf8"));
-    const insertAccount = db.prepare("INSERT INTO accounts VALUES (?, ?, ?, ?)");
-    for (const row of readTable(join(data, "accounts.csv"))) {
-      insertAccount.run(row.account, row.bank, row.tag, row.folder || row.account);
-    }
     db.exec("BEGIN");
+    seed(db, data, "accounts", "accounts.csv", (path) => {
+      const insert = db.prepare("INSERT INTO accounts VALUES (?, ?, ?, ?)");
+      for (const row of readTable(path)) insert.run(row.account, row.bank, row.tag, row.folder || row.account);
+    });
     loadTransactions(db, data);
-    loadRules(db, data);
-    loadOverrides(db, data);
-    db.exec("COMMIT");
+    seed(db, data, "rules", "rules.csv", (path) => seedRules(db, path));
+    seed(db, data, "overrides", "overrides.csv", (path) => seedOverrides(db, path));
+    checkTables(db);
+    // Views hold no data, so they are dropped and made again from views.sql.
+    const views = db.prepare("SELECT name FROM sqlite_master WHERE type = 'view'").all() as Row[];
+    for (const { name } of views) db.exec(`DROP VIEW "${name}"`);
     db.exec(readFileSync(join(HERE, "views.sql"), "utf8"));
+    db.exec("COMMIT");
 
     // The ledger must account for every cleared penny, no more and no less.
     const total = (view: string) =>
@@ -550,6 +598,7 @@ export function build(data: string): DatabaseSync {
     }
     return db;
   } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK");
     db.close();
     throw error;
   }
