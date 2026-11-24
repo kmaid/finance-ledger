@@ -153,7 +153,8 @@ function parseTide(rows: Row[]): Transaction[] {
       type: column(row, "Transaction type"),
       status: column(row, "Status").toLowerCase(),
       bank_category: column(row, "Category name"),
-      bank_tag: column(row, "Tag 1"),
+      // Savings accounts export without the tag column.
+      bank_tag: row["Tag 1"] ?? "",
     };
   });
 }
@@ -284,11 +285,156 @@ function parseChase(rows: Row[]): Transaction[] {
   });
 }
 
-/** How to read each bank's exports. `titleLines` is how many lines a file has above its header. */
-const BANKS: Record<string, { parse: (rows: Row[]) => Transaction[]; titleLines?: number }> = {
+const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
+
+/** The text inside an HTML fragment: tags dropped, entities decoded, runs of space made one. */
+function htmlText(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, "")
+    .replace(/&(#\d+|[a-z]+);/gi, (entity, name: string) =>
+      name.startsWith("#") ? String.fromCharCode(Number(name.slice(1))) : (ENTITIES[name.toLowerCase()] ?? entity),
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The cells of every row of the tables in an HTML page. */
+export function parseHtmlTable(html: string): string[][] {
+  return [...html.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].map(([, row]) =>
+    [...row!.matchAll(/<td\b[^>]*?(?:\/>|>([\s\S]*?)<\/td>)/gi)].map(([, cell]) => htmlText(cell ?? "")),
+  );
+}
+
+/**
+ * Santander's "Excel" download is an HTML page in Latin-1 with an .xls name:
+ * a few title rows, then a header row starting 'Date', then one row per
+ * transaction with blank spacer cells between the columns. The spacers are
+ * dropped by keeping only the cells under a header.
+ */
+function readSantander(path: string): Row[] {
+  const records = parseHtmlTable(readFileSync(path, "latin1"));
+  const start = records.findIndex((record) => record.includes("Date") && record.includes("Balance"));
+  if (start === -1) throw new Error("no header row with 'Date' and 'Balance'");
+  const header = records[start]!;
+  const columns = header.flatMap((name, i) => (name === "" ? [] : [[name, i] as const]));
+  return records
+    .slice(start + 1)
+    .filter((record) => /^\d\d\/\d\d\/\d{4}$/.test(record[header.indexOf("Date")] ?? ""))
+    .map((record) => Object.fromEntries(columns.map(([name, i]) => [name, record[i] ?? ""])));
+}
+
+/** '£1,234.56' or '-£1,234.56' -> pence. */
+function santanderPence(text: string): number {
+  return pence(text.replace("£", ""));
+}
+
+/**
+ * Santander puts the kind of payment, the other party and the reference in one
+ * description. The common shapes are taken apart here; anything else keeps the
+ * whole description as its payee.
+ */
+export function santanderDescription(description: string): { type: string; payee: string; reference: string } {
+  const shapes: [RegExp, string][] = [
+    [/^DIRECT DEBIT PAYMENT TO (?<payee>.+?) REF (?<reference>.*?)(?:, MANDATE NO \d+)?$/, "Direct debit"],
+    [/^STANDING ORDER VIA FASTER PAYMENT TO (?<payee>.+?) REFERENCE (?<reference>.*?)\s*(?:, MANDATE NO \d*)?$/, "Standing order"],
+    [/^BILL PAYMENT (?:VIA FASTER PAYMENT )?TO (?<payee>.+?) REFERENCE (?<reference>.*?)\s*(?:, MANDATE NO \d*)?$/, "Payment"],
+    [/^FASTER PAYMENTS RECEIPT REF\.?(?<reference>.*?) FROM (?<payee>.+)$/, "Payment"],
+    [/^FASTER PAYMENTS RECEIPT FROM (?<payee>.+)$/, "Payment"],
+    [/^BANK GIRO CREDIT REF (?<payee>[^,]+),?\s*(?<reference>.*)$/, "Credit"],
+    // Older card payments put the amount and rate after the payee: 'TO EDREAMS,209.60 GBP, RATE 1.00/GBP ON ...'.
+    [/^CARD PAYMENT TO (?<payee>.+?)(?:,[\d,]+\.\d\d [A-Z]{3}, RATE \S+)?\s+ON \d\d-\d\d-\d{4}$/, "Card payment"],
+    [/^(?<payee>.+?) \(VIA (?:GOOGLE|APPLE) PAY\), ON \d\d-\d\d-\d{4}$/, "Card payment"],
+    [/^CREDIT FROM (?<payee>.+?) ON \d\d-\d\d-\d{4}$/, "Refund"],
+    [/^CASH WITHDRAWAL AT (?<payee>.+?),/, "Cash withdrawal"],
+    [/^\d+ Direct Debit Payments? .*Cashback$/, "Cashback"],
+    [/^MAINTAINING THE ACCOUNT/, "Fee"],
+    [/^INTEREST PAID/, "Interest"],
+  ];
+  for (const [pattern, type] of shapes) {
+    const match = pattern.exec(description);
+    if (match) {
+      const payee = match.groups?.payee?.trim() ?? "Santander";
+      return { type, payee, reference: match.groups?.reference?.trim() ?? "" };
+    }
+  }
+  return { type: "", payee: description, reference: "" };
+}
+
+/**
+ * Santander gives no transaction id or time, so the id is made the way Chase's
+ * is: a hash of the date, description and amount, then a count for rows that
+ * are the same in all three. A download covers whole days, so such rows are
+ * always in the same file. Rows come newest first; the balances are checked
+ * oldest first, each one the one before plus the amount.
+ */
+function parseSantander(rows: Row[]): Transaction[] {
+  const seen = new Map<string, number>();
+  let before: number | undefined;
+  return rows.toReversed().map((row) => {
+    const [day, month, year] = column(row, "Date").split("/");
+    const posted_at = `${year}-${month}-${day} 00:00:00`;
+    const description = column(row, "Description");
+    const amount = santanderPence(column(row, "Money in")) - santanderPence(column(row, "Money Out"));
+    const balance = santanderPence(column(row, "Balance"));
+    if (before !== undefined && before + amount !== balance) {
+      throw new Error(`the balance does not follow from the row before on ${posted_at.slice(0, 10)}`);
+    }
+    before = balance;
+    const hash = createHash("sha256").update([posted_at, description, amount].join("\t")).digest("hex").slice(0, 16);
+    const count = (seen.get(hash) ?? 0) + 1;
+    seen.set(hash, count);
+    return {
+      bank_id: `${hash}-${count}`,
+      posted_at,
+      amount_pence: amount,
+      description,
+      ...santanderDescription(description),
+      status: "cleared",
+      bank_category: "",
+      bank_tag: "",
+    };
+  });
+}
+
+/**
+ * Monzo's CSV export from the app: one row per transaction with Monzo's own
+ * id, the date as dd/mm/yyyy and a separate time. Pots are separate accounts
+ * in Monzo, so money moved to or from one is a 'Pot transfer' here.
+ */
+function parseMonzo(rows: Row[]): Transaction[] {
+  return rows.map((row) => {
+    const [day, month, year] = column(row, "Date").split("/");
+    if (column(row, "Currency") !== "GBP") throw new Error(`not in pounds: ${column(row, "Transaction ID")}`);
+    return {
+      bank_id: column(row, "Transaction ID"),
+      posted_at: `${year}-${month}-${day} ${column(row, "Time")}`,
+      amount_pence: pence(column(row, "Amount")),
+      description: column(row, "Description"),
+      payee: column(row, "Name"),
+      reference: column(row, "Notes and #tags"),
+      type: column(row, "Type"),
+      status: "cleared",
+      bank_category: column(row, "Category"),
+      bank_tag: "",
+    };
+  });
+}
+
+type Bank = {
+  parse: (rows: Row[]) => Transaction[];
+  /** How many lines a .csv or .tsv file has above its header. */
+  titleLines?: number;
+  /** Reads a file this bank's way instead of as a .csv or .tsv table. */
+  read?: (path: string) => Row[];
+};
+
+/** How to read each bank's exports. */
+const BANKS: Record<string, Bank> = {
   tide: { parse: parseTide },
   uphold: { parse: parseUphold },
   chase: { parse: parseChase, titleLines: 1 },
+  santander: { parse: parseSantander, read: readSantander },
+  monzo: { parse: parseMonzo },
   plain: { parse: parsePlain },
 };
 
@@ -316,10 +462,12 @@ function loadTransactions(db: DatabaseSync, data: string): void {
       throw new Error(`accounts.csv: no parser for bank '${bank}' (have: ${Object.keys(BANKS).join(", ")})`);
     }
     const folder = join(data, "exports", name);
-    const files = existsSync(folder) ? readdirSync(folder).filter((file) => /\.(csv|tsv)$/.test(file)) : [];
+    const files = existsSync(folder) ? readdirSync(folder).filter((file) => /\.(csv|tsv|xls)$/.test(file)) : [];
     const exports = files.map((file) => {
       try {
-        return { file, transactions: reader.parse(readTable(join(folder, file), reader.titleLines)) };
+        const path = join(folder, file);
+        const rows = reader.read ? reader.read(path) : readTable(path, reader.titleLines);
+        return { file, transactions: reader.parse(rows) };
       } catch (error) {
         throw new Error(`${join(folder, file)}: not a ${bank} export this parser understands, ${(error as Error).message}`);
       }

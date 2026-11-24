@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, test } from "node:test";
-import { build, parseCsv, parseTsv, pence } from "./ledger.ts";
+import { build, parseCsv, parseHtmlTable, parseTsv, pence, santanderDescription } from "./ledger.ts";
 
 let data: string;
 let db: DatabaseSync | undefined;
@@ -202,4 +202,36 @@ test("personal income and spending leave transfers out", () => {
   assert.deepEqual(rows("SELECT * FROM personal_monthly WHERE month = '2025-02'"), [
     ["2025-02", 2000, -16.8, -400, 1583.2],
   ]);
+});
+
+test("parseHtmlTable reads cells, empty cells and entities", () => {
+  assert.deepEqual(parseHtmlTable("<table><tr><td /><td>A &amp; B</td></tr><tr><td><font>\n 1\n</font></td></tr></table>"), [
+    ["", "A & B"],
+    ["1"],
+  ]);
+});
+
+test("santander descriptions are split into type, payee and reference", () => {
+  const cases: [string, ReturnType<typeof santanderDescription>][] = [
+    [
+      "DIRECT DEBIT PAYMENT TO THAMES WATER REF 9001234, MANDATE NO 0016",
+      { type: "Direct debit", payee: "THAMES WATER", reference: "9001234" },
+    ],
+    [
+      "STANDING ORDER VIA FASTER PAYMENT TO LB LAMBETH SERV REFERENCE 6539 , MANDATE NO 0001",
+      { type: "Standing order", payee: "LB LAMBETH SERV", reference: "6539" },
+    ],
+    [
+      "FASTER PAYMENTS RECEIPT REF.18 EXAMPLE RD FROM SMITH J",
+      { type: "Payment", payee: "SMITH J", reference: "18 EXAMPLE RD" },
+    ],
+    [
+      "CARD PAYMENT TO EDREAMS,209.60 GBP, RATE 1.00/GBP ON 16-12-2019",
+      { type: "Card payment", payee: "EDREAMS", reference: "" },
+    ],
+    ["CARD PAYMENT TO SMARTY CO UK   ON 11-12-2025", { type: "Card payment", payee: "SMARTY CO UK", reference: "" }],
+    ["2 Direct Debit Payments at 2,00% Cashback", { type: "Cashback", payee: "Santander", reference: "" }],
+    ["SOMETHING NEW", { type: "", payee: "SOMETHING NEW", reference: "" }],
+  ];
+  for (const [description, expected] of cases) assert.deepEqual(santanderDescription(description), expected);
 });

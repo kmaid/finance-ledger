@@ -23,7 +23,7 @@ To try it with made-up data: `node ledger.ts examples`
 | File | What it is |
 | --- | --- |
 | `accounts.csv` | One line per account: its name, its bank, a tag (`business` or `personal`), and optionally the folder its exports are in. |
-| `exports/<folder>/` | Exports from the bank (`.csv` or `.tsv`), unedited. Overlapping exports are fine. The folder is the account name unless `accounts.csv` gives another, such as `chase/spending`. |
+| `exports/<folder>/` | Exports from the bank (`.csv`, `.tsv` or Santander's `.xls`), unedited. Overlapping exports are fine. The folder is the account name unless `accounts.csv` gives another, such as `chase/spending`. |
 | `rules.csv` | Puts transactions in categories. Optional. |
 | `overrides.csv` | Categorises single transactions by hand. Optional. |
 
@@ -116,6 +116,8 @@ sqlite3 data/ledger.db "SELECT * FROM transfer_pairs WHERE out_account = 'chase-
 | `tide` | Tide's CSV export with `Transaction ID`, `Paid in` and `Paid out` columns. |
 | `uphold` | Uphold's transaction history CSV. Only the pound side of each row is kept: deposits, withdrawals, and crypto bought or sold for pounds. Rows with no pounds in them are skipped. |
 | `chase` | Chase UK statement transactions as tab-separated text (`.tsv`): a title line, then `Date`, `Time`, `Transaction Type`, `Transaction Description`, `Amount`, `Currency`, `Balance`. One folder per account or pot. Chase gives no transaction id, so one is made from each row's time, type, description and amount. Each file's balances are checked: every balance must be the one before plus the amount. |
+| `santander` | Santander UK's "Download transactions" in Excel format. The `.xls` files are really HTML tables in Latin-1, with `Date`, `Description`, `Money in`, `Money Out` and `Balance`. As with Chase, ids are made from each row (date, description, amount) and each file's balances are checked. The payee, type and reference are taken out of the description. Santander only lets you download about the last seven years. |
+| `monzo` | Monzo's CSV export from the app (account ⋮ → Bank statements → CSV). The web app only shows recent transactions and the app fails on long ranges, so export a year at a time. Each row has Monzo's `Transaction ID`. Pots are not exported; moves to and from them are `Pot transfer` lines. |
 | `plain` | A CSV you have made yourself with the columns of the `transactions` table and an `amount` in pounds. For one-off imports from a bank that is not worth a parser. See `examples/exports/old-bank/`. |
 
 To add a bank, write a `parse<Bank>` function in `ledger.ts` that returns the
